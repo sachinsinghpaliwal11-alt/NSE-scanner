@@ -8,11 +8,15 @@ scores Nifty 50 stocks and sends LONG / SHORT ideas to Telegram. It never places
     python nse_scan.py --test              sends one test message to Telegram
     python nse_scan.py --dry-run           prints signals instead of sending them
 
+Every alert is also saved to journal.json / journal.csv / summary.md and later marked as
+target hit, stop-loss hit, or expired, so you can see the real win rate of the signals.
+
 Needs: pip install requests
 Secrets (environment): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Not investment advice. Signals are setups, not guarantees, and many will lose.
 """
 import argparse
+import csv
 import datetime as dt
 import json
 import os
@@ -481,6 +485,148 @@ def env_num(name, default):
         return float(default)
 
 
+# ------------------------------------------------------------------ journal
+def ist_str(ts):
+    return dt.datetime.fromtimestamp(ts, IST).strftime("%Y-%m-%d %H:%M")
+
+
+def load_journal(d):
+    try:
+        with open(os.path.join(d, "journal.json")) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def new_record(mode, sym, r, sl_mult, k1, t_now):
+    side = "LONG" if r["score"] > 0 else "SHORT"
+    sg = 1 if side == "LONG" else -1
+    risk = sl_mult * r["atr"]
+    p = r["price"]
+    return {"id": f"{mode}|{sym}|{side}|{int(t_now)}", "mode": mode, "symbol": sym, "side": side,
+            "score": r["score"], "ts": int(t_now), "time": ist_str(t_now),
+            "candle_ts": k1[-1]["ts"], "date": k1[-1]["date"],
+            "entry": p, "sl": p - sg * risk, "tp1": p + sg * 1.5 * risk, "tp2": p + sg * 3 * risk, "risk": risk,
+            "status": "open", "exit_price": None, "exit_time": None, "r": None}
+
+
+def close_signal(s, status, price, ts):
+    sg = 1 if s["side"] == "LONG" else -1
+    s["status"], s["exit_price"], s["exit_time"] = status, price, ist_str(ts)
+    s["r"] = round(sg * (price - s["entry"]) / s["risk"], 2) if s["risk"] else 0.0
+
+
+def resolve_signal(s, k):
+    """Walks the candles after the signal. First level touched decides: stop-loss (-1R) or target 1 (+1.5R).
+    If both are touched inside one candle it counts as a loss. Returns True if the signal was closed."""
+    sg = 1 if s["side"] == "LONG" else -1
+    after = [c for c in k if c["ts"] > s["candle_ts"]]
+    for c in after:
+        hit_sl = c["low"] <= s["sl"] if sg == 1 else c["high"] >= s["sl"]
+        hit_tp = c["high"] >= s["tp1"] if sg == 1 else c["low"] <= s["tp1"]
+        if hit_sl:
+            close_signal(s, "sl", s["sl"], c["ts"])
+            return True
+        if hit_tp:
+            close_signal(s, "tp1", s["tp1"], c["ts"])
+            return True
+    if s["mode"] == "intraday":
+        same = [c for c in after if c["date"] == s["date"]]
+        later = [c for c in after if c["date"] > s["date"]]
+        if same and (later or same[-1]["slot"] >= 915):  # session is over
+            close_signal(s, "expired", same[-1]["close"], same[-1]["ts"])
+            return True
+        if later and not same:
+            close_signal(s, "expired", later[0]["open"], later[0]["ts"])
+            return True
+    elif len(after) >= 10:  # positional signals are given 10 trading days
+        close_signal(s, "expired", after[9]["close"], after[9]["ts"])
+        return True
+    return False
+
+
+def result_message(s):
+    head = f"RESULT: {s['symbol']} {s['side']} ({s['mode']}, signal from {s['time']})"
+    if s["status"] == "tp1":
+        return f"{head}\nTarget 1 hit: {s['r']:+.1f}R"
+    if s["status"] == "sl":
+        return f"{head}\nStop-loss hit: {s['r']:+.1f}R"
+    return f"{head}\nClosed without hitting either level: {s['r']:+.2f}R"
+
+
+def update_open_signals(journal, dry):
+    opens = [s for s in journal if s["status"] == "open"]
+    cache, changed = {}, False
+    for s in opens:
+        iv = "15m" if s["mode"] == "intraday" else "1d"
+        key = (s["symbol"], iv)
+        if key not in cache:
+            try:
+                cache[key] = klines(s["symbol"], iv)
+            except Exception as e:
+                print(f"Journal: could not update {s['symbol']}: {e}")
+                cache[key] = None
+        if cache[key] and resolve_signal(s, cache[key]):
+            changed = True
+            if os.environ.get("NOTIFY_RESULTS", "on").lower() != "off":
+                send_telegram(result_message(s), dry)
+    return changed
+
+
+def journal_stats(journal, mode=None):
+    rows = [s for s in journal if s["status"] != "open" and (mode is None or s["mode"] == mode)]
+    wins = [s for s in rows if s["r"] > 0]
+    total = sum(s["r"] for s in rows)
+    return {"closed": len(rows), "wins": len(wins), "losses": len(rows) - len(wins),
+            "rate": (100 * len(wins) / len(rows)) if rows else None,
+            "avg": (total / len(rows)) if rows else None, "total": total}
+
+
+def result_text(s):
+    if s["status"] == "open":
+        return "Open"
+    if s["status"] == "tp1":
+        return "Target 1 hit"
+    if s["status"] == "sl":
+        return "Stop-loss hit"
+    return f"Closed {s['r']:+.2f}R"
+
+
+def save_journal(d, journal, t_now):
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "journal.json"), "w") as f:
+        json.dump(journal, f, indent=1)
+    with open(os.path.join(d, "journal.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time_ist", "mode", "symbol", "side", "score", "entry", "stop_loss", "target1", "target2",
+                    "status", "exit_time_ist", "exit_price", "r_multiple"])
+        for s in reversed(journal):
+            w.writerow([s["time"], s["mode"], s["symbol"], s["side"], s["score"], round(s["entry"], 2),
+                        round(s["sl"], 2), round(s["tp1"], 2), round(s["tp2"], 2), s["status"],
+                        s["exit_time"] or "", round(s["exit_price"], 2) if s["exit_price"] else "", s["r"] if s["r"] is not None else ""])
+    lines = ["# Signal journal", "",
+             f"Updated {ist_str(t_now)} IST. Every alert is logged and marked when it hits target 1 (+1.5R) or the stop-loss (-1R).",
+             "R means one unit of risk, the distance from entry to stop-loss. If both levels are touched inside one candle it counts as a loss. "
+             "Intraday signals close at the end of the session; positional signals are given 10 trading days. "
+             "Entry is taken at the signal candle's close, so real fills will differ. Not investment advice.", "",
+             "## Results", "", "| Mode | Closed | Wins | Losses | Win rate | Average R | Total R |", "|---|---|---|---|---|---|---|"]
+    for label, m in (("All", None), ("Intraday", "intraday"), ("MTF", "mtf")):
+        st = journal_stats(journal, m)
+        rate = f"{st['rate']:.0f}%" if st["rate"] is not None else "-"
+        avg = f"{st['avg']:+.2f}" if st["avg"] is not None else "-"
+        lines.append(f"| {label} | {st['closed']} | {st['wins']} | {st['losses']} | {rate} | {avg} | {st['total']:+.1f} |")
+    n_open = sum(1 for s in journal if s["status"] == "open")
+    lines += ["", f"Open signals: {n_open}."]
+    if journal_stats(journal)["closed"] < 50:
+        lines.append("Fewer than 50 closed signals so far, so the win rate is not reliable yet.")
+    lines += ["", "## Latest signals", "", "| Time (IST) | Mode | Stock | Side | Entry | Stop-loss | Target 1 | Result |", "|---|---|---|---|---|---|---|---|"]
+    for s in reversed(journal[-40:]):
+        lines.append(f"| {s['time']} | {s['mode']} | {s['symbol']} | {s['side']} | {fmt(s['entry'])} | {fmt(s['sl'])} | {fmt(s['tp1'])} | {result_text(s)} |")
+    with open(os.path.join(d, "summary.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser()
@@ -489,6 +635,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print instead of sending to Telegram")
     ap.add_argument("--force", action="store_true", help="ignore the intraday time window")
     ap.add_argument("--state", default="state.json")
+    ap.add_argument("--journal-dir", default=".")
     args = ap.parse_args()
     mode, dry = args.mode, args.dry_run
 
@@ -503,8 +650,14 @@ def main():
     t_now = now()
     ist = dt.datetime.fromtimestamp(t_now, IST)
     mins = ist.hour * 60 + ist.minute
+
+    journal = load_journal(args.journal_dir)
+    changed = update_open_signals(journal, dry) if journal else False
+
     if mode == "intraday" and not args.force and (ist.weekday() >= 5 or mins < 570 or mins > 885):
-        print(f"Outside the intraday window ({ist:%a %H:%M} IST). Nothing to do.")
+        if changed:
+            save_journal(args.journal_dir, journal, t_now)
+        print(f"Outside the intraday window ({ist:%a %H:%M} IST). Nothing new to scan.")
         return 0
 
     opts = {
@@ -550,11 +703,15 @@ def main():
                     r["why"].append(f"Filters passed: ADX {r['adx']:.0f}, {abs(r['stretch']):.1f} ATR from EMA20")
                     if send_telegram(build_message(sym, r, sl_mult, mode), dry):
                         state["sent"][key] = t_now
+                        journal.append(new_record(mode, sym, r, sl_mult, k1, t_now))
+                        changed = True
                         sent += 1
         time.sleep(0.3)
 
     with open(args.state, "w") as f:
         json.dump(state, f)
+    if changed:
+        save_journal(args.journal_dir, journal, t_now)
 
     rows.sort(key=lambda x: -abs(x[1]))
     print(f"Scanned {len(rows)} of {len(symbols)} stocks in {mode} mode. Signals sent: {sent}.")
