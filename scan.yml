@@ -3,9 +3,10 @@ name: NSE scanner
 on:
   schedule:
     # Intraday: every 5 minutes from 09:30 to 15:25 IST (04:00 to 09:55 UTC), Monday to Friday.
-    # The script itself only alerts between 9:30 AM and 2:45 PM IST.
+    # The script itself only sends alerts between 9:30 AM and 2:45 PM IST.
     - cron: "*/5 4-9 * * 1-5"
     # MTF / positional: once after the market closes, 4:00 PM IST (10:30 UTC).
+    # This run also settles that day's intraday signals in the journal.
     - cron: "30 10 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -20,7 +21,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write   # lets the scanner save journal.csv and summary.md into this repository
 
 concurrency:
   group: nse-scan
@@ -65,3 +66,18 @@ jobs:
             ARGS="--mode intraday"
           fi
           python nse_scan.py $ARGS
+
+      # Saves the signal journal back into the repository, only when something changed.
+      - name: Save journal
+        if: always()
+        run: |
+          git config user.name "nse-scanner-bot"
+          git config user.email "nse-scanner-bot@users.noreply.github.com"
+          for f in journal.json journal.csv summary.md; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          if ! git diff --cached --quiet; then
+            git commit -m "Update signal journal"
+            git pull --rebase --autostash || true
+            git push || echo "Could not push the journal this time; it will be retried on the next run."
+          fi
