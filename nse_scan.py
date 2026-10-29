@@ -402,13 +402,13 @@ def yahoo_candles(sym, interval, rng, always_drop_last=False):
     err = None
     for host in ("query1", "query2"):
         base = YF_BASE or f"https://{host}.finance.yahoo.com"
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = SESSION.get(f"{base}/v8/finance/chart/{quote(ticker, safe='')}",
-                                   params={"interval": interval, "range": rng}, timeout=20)
+                                   params={"interval": interval, "range": rng}, timeout=(5, 10))
                 if resp.status_code == 429:
                     err = RuntimeError(f"{sym}: HTTP 429 (Yahoo is rate limiting)")
-                    time.sleep(2 + attempt * 3)
+                    time.sleep(1 + attempt)
                     continue
                 if resp.status_code != 200:
                     raise RuntimeError(f"{sym}: HTTP {resp.status_code}")
@@ -629,6 +629,10 @@ def save_journal(d, journal, t_now):
 
 # ------------------------------------------------------------------ main
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # show log lines while the scan runs
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["intraday", "mtf"], default=os.environ.get("MODE") or "intraday")
     ap.add_argument("--test", action="store_true", help="send one test message and exit")
@@ -678,7 +682,14 @@ def main():
     first_err = ""
     rows = []
 
-    for sym in symbols:
+    started = time.time()
+    for n, sym in enumerate(symbols, 1):
+        if time.time() - started > 360:
+            print(f"Time limit reached after {n - 1} stocks. Stopping this scan early.")
+            break
+        if n == 6 and fails >= 5 and not rows and not stale:
+            print("The first 5 stocks all failed, so Yahoo is probably blocking this server. Stopping early.")
+            break
         try:
             k1 = klines(sym, "15m" if mode == "intraday" else "1d")
             if mode == "intraday" and k1[-1]["date"] != today:
@@ -689,6 +700,7 @@ def main():
         except Exception as e:
             fails += 1
             first_err = first_err or str(e)
+            print(f"{sym}: failed ({str(e)[:120]})")
             continue
         rows.append((sym, r["score"], r["price"]))
         if abs(r["score"]) >= opts["min_score"]:
